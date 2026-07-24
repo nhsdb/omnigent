@@ -128,12 +128,29 @@ def _open_popover(page: Page) -> None:
     follows. Pressing Escape first guarantees we re-open from a closed state
     rather than toggling an already-open popover shut.
 
+    The trigger hover-opens on the click's own pointer arrival, then the
+    click's Radix toggle can flip it back shut if it lands past the button's
+    hover-click grace window (see ``AgentInfo.tsx`` ``HOVER_CLICK_GRACE_MS``)
+    — a swallowed open under load. Retry the click until the panel mounts so
+    the race doesn't surface as a bare visibility timeout.
+
     :param page: Playwright page on a ``/c/<id>`` route.
     """
     page.keyboard.press("Escape")
     trigger = page.locator(_AGENT_INFO_TRIGGER)
     expect(trigger).to_be_visible(timeout=30_000)
-    trigger.click()
+    panel = page.locator('[data-testid="agent-info-panel"]')
+    for _ in range(5):
+        trigger.click()
+        try:
+            expect(panel).to_be_visible(timeout=3_000)
+            break
+        except AssertionError:
+            # The hover-open was toggled shut by the same click; re-arm from a
+            # closed state and try again.
+            page.keyboard.press("Escape")
+    else:
+        expect(panel).to_be_visible(timeout=3_000)
     # "Policies" section label proves the popover content mounted.
     expect(page.get_by_text("Policies", exact=True)).to_be_visible(timeout=15_000)
 
