@@ -611,6 +611,7 @@ class TestCodexExecutor(unittest.TestCase):
                 [call.args[0] for call in calls],
                 ["thread/start", "thread/goal/set", "turn/start"],
             )
+            self.assertNotIn("modelProvider", calls[0].args[1])
             self.assertEqual(
                 calls[1].args[1],
                 {"threadId": "thread-1", "objective": "Finish and test"},
@@ -618,6 +619,51 @@ class TestCodexExecutor(unittest.TestCase):
             self.assertEqual(
                 calls[2].args[1]["input"],
                 [{"type": "text", "text": "Finish and test"}],
+            )
+
+        _run(_t())
+
+    def test_brokered_app_server_pins_provider_on_thread_start(self):
+        async def _t():
+            session = _CodexAppServerSession(
+                codex_path="/bin/echo",
+                cwd="/tmp/workspace",
+                env={},
+                tool_executor=None,
+                thread_model_provider="omnigent_brokered",
+            )
+            session.start = AsyncMock()
+            session._proc = _FakeProcess()
+            session._request = AsyncMock(
+                side_effect=[
+                    {"result": {"thread": {"id": "thread-1"}}},
+                    {"result": {"turn": {"id": "turn-1"}}},
+                ]
+            )
+
+            async def _inject_turn_completed() -> None:
+                await asyncio.sleep(0.01)
+                session._events.put_nowait(
+                    {"method": "turn/completed", "params": {"turn": {"id": "turn-1"}}}
+                )
+
+            inject_task = asyncio.create_task(_inject_turn_completed())
+            async for _event in session.run_turn(
+                messages=[{"role": "user", "content": "hi"}],
+                tools=[],
+                system_prompt="",
+                model="gpt-5.4-mini",
+                cwd=".",
+                sandbox="workspace-write",
+            ):
+                pass
+            await inject_task
+
+            thread_start = session._request.await_args_list[0]
+            self.assertEqual(thread_start.args[0], "thread/start")
+            self.assertEqual(
+                thread_start.args[1]["modelProvider"],
+                "omnigent_brokered",
             )
 
         _run(_t())
@@ -4090,6 +4136,27 @@ def test_signer_backed_executor_rejects_missing_sandbox_before_session() -> None
         CodexExecutor(
             codex_path="/bin/echo",
             model="gpt-5.4-mini",
+            signer_launch_config=config,
+        )
+
+
+def test_signer_backed_executor_rejects_ordinary_egress_rules_before_session() -> None:
+    config = SignerLaunchConfig(
+        binding_id="test-fake-provider-v1",
+        endpoint="https://model.test/v1",
+        routes=(FrozenModelRoute(method="POST", host="model.test", path="/v1/responses"),),
+    )
+
+    with pytest.raises(ValueError, match=r"does not support os_env\.sandbox\.egress_rules"):
+        CodexExecutor(
+            codex_path="/bin/echo",
+            model="gpt-5.4-mini",
+            os_env=OSEnvSpec(
+                sandbox=OSEnvSandboxSpec(
+                    type="darwin_seatbelt",
+                    egress_rules=["GET api.github.com/repos/company/**"],
+                )
+            ),
             signer_launch_config=config,
         )
 

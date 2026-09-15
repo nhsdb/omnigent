@@ -57,7 +57,11 @@ from . import _proc
 from ._subprocess_lifecycle import close_subprocess_transport, terminate_subprocess
 from .async_utils import run_sync_on_thread
 from .codex_goal_command import goal_objective_from_content as _goal_objective_from_content
-from .codex_worker import CodexWorkerLaunch, prepare_codex_worker
+from .codex_worker import (
+    CodexWorkerLaunch,
+    prepare_codex_catalog_probe,
+    prepare_codex_worker,
+)
 from .databricks_executor import (
     _databricks_gateway_host,
 )
@@ -184,6 +188,7 @@ _CODEX_HOME_SYMLINK_DIRS = (
 )
 _CODEX_MINIMAL_CONFIG_ENV = "HARNESS_CODEX_MINIMAL_CONFIG"
 _CODEX_PROVIDER_CONFIG_PREFIX = "model_providers."
+_BROKERED_CODEX_PROVIDER_NAME = "omnigent_brokered"
 
 # Environment variables explicitly excluded from the codex subprocess even
 # when their prefix is in the allowlist. ``OPENAI_API_KEY`` is stripped so
@@ -875,6 +880,7 @@ def _populate_codex_home_config(
     inject_hooks: bool = False,
     extend_model_catalog: bool = False,
     include_credentials: bool = True,
+    required_brokered_probe: tuple[str, Path, OSEnvSpec] | None = None,
 ) -> None:
     """
     Bridge user config files from the real ``CODEX_HOME`` into the temp one.
@@ -923,7 +929,25 @@ def _populate_codex_home_config(
     :param include_credentials: Bridge host credential stores. Signer-backed
         workers set this to ``False`` because authentication stays exclusively
         in the trusted signer process.
+    :param required_brokered_probe: Codex path, working directory, and active
+        sandbox used to write a network-denied bundled catalog.
     """
+    if required_brokered_probe is not None:
+        codex_path, cwd, os_env = required_brokered_probe
+        probe = prepare_codex_catalog_probe(
+            codex_path=codex_path,
+            cwd=cwd,
+            codex_home=target_dir,
+            os_env=os_env,
+            spawn_env_names=["PATH", "LANG", "LC_ALL", "TZ", "HOME", "CODEX_HOME"],
+        )
+        try:
+            write_required_brokered_model_catalog(
+                target_dir,
+                codex_path=probe.launch_path,
+            )
+        finally:
+            probe.close()
     if not source_dir.is_dir():
         return
 
@@ -1445,6 +1469,8 @@ _CODEX_OMNIGENT_LAUNCH_ENV_VARS: tuple[str, ...] = (
 # Catalog file written into the private codex-home, naming the models the
 # session's ``spawn_agent`` may target. See :func:`extended_model_catalog`.
 _CODEX_MODEL_CATALOG_FILENAME = "model_catalog.json"
+_BROKERED_MODEL_CATALOG_MAX_BYTES = 4 * 1024 * 1024
+_BROKERED_MODEL_SLUG_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}\Z")
 # Entry a gateway-only model is cloned from: the cheapest current arm, so an
 # unset field inherits a sane current-generation value rather than a frozen one.
 _CATALOG_CLONE_SOURCE_SLUG = CODEX_CATALOG_CLONE_SOURCE_SLUG
@@ -1578,6 +1604,15 @@ def _valid_model_catalog(catalog: object) -> bool:
     return True
 
 
+def _valid_brokered_model_catalog(catalog: object) -> bool:
+    if not _valid_model_catalog(catalog):
+        return False
+    assert isinstance(catalog, dict)
+    models = catalog["models"]
+    assert isinstance(models, list)
+    return all(_BROKERED_MODEL_SLUG_RE.fullmatch(entry["slug"]) is not None for entry in models)
+
+
 def read_codex_model_catalog(
     codex_path: str,
     source_home: Path,
@@ -1694,11 +1729,6 @@ def write_codex_model_catalog(
     return path
 
 
-# ``model_catalog_json`` assignment appended to the private config copy. A
-# top-level key, so it goes before the first table header.
-_CATALOG_KEY_RE = re.compile(r"^\s*model_catalog_json\s*=")
-
-
 def set_codex_model_catalog_path(config_path: Path, catalog_path: Path) -> bool:
     """
     Point the session's private ``config.toml`` at *catalog_path*.
@@ -1709,28 +1739,93 @@ def set_codex_model_catalog_path(config_path: Path, catalog_path: Path) -> bool:
     :returns: ``True`` when the key was written, ``False`` when the config
         already sets one (the user's choice wins) or the write failed.
     """
+    import tomlkit
+
     try:
-        lines = config_path.read_text(encoding="utf-8").splitlines(keepends=True)
-    except OSError as exc:
+        existing = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
+        document = tomlkit.parse(existing) if existing else tomlkit.document()
+    except (OSError, ValueError) as exc:
         logger.warning("could not read %s (%s)", config_path, exc)
         return False
-    for line in lines:
-        if line.lstrip().startswith("["):
-            break
-        if _CATALOG_KEY_RE.match(line):
-            return False
-    assignment = f"model_catalog_json = {json.dumps(str(catalog_path))}\n"
-    # Before the first table header, so the key stays top-level.
-    insert_at = next(
-        (i for i, line in enumerate(lines) if line.lstrip().startswith("[")), len(lines)
-    )
-    lines.insert(insert_at, assignment)
+    if "model_catalog_json" in document:
+        return False
+    document["model_catalog_json"] = str(catalog_path)
+    config_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix="config.toml.", dir=str(config_path.parent))
     try:
-        config_path.write_text("".join(lines), encoding="utf-8")
+        os.chmod(tmp_name, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(tomlkit.dumps(document))
+        os.replace(tmp_name, config_path)
+        os.chmod(config_path, 0o600)
     except OSError as exc:
         logger.warning("could not write %s (%s)", config_path, exc)
         return False
+    finally:
+        with suppress(FileNotFoundError):
+            os.unlink(tmp_name)
     return True
+
+
+def write_required_brokered_model_catalog(
+    target_dir: Path,
+    *,
+    codex_path: str,
+    timeout: float = 10.0,
+) -> Path:
+    """Write the bundled Codex catalog required by a brokered session."""
+    env = {
+        name: value
+        for name in ("PATH", "LANG", "LC_ALL", "TZ")
+        if (value := os.environ.get(name)) is not None
+    }
+    env.setdefault("PATH", os.defpath)
+    env["HOME"] = str(target_dir)
+    env["CODEX_HOME"] = str(target_dir)
+    try:
+        completed = subprocess.run(
+            [codex_path, "debug", "models", "--bundled"],
+            capture_output=True,
+            timeout=timeout,
+            env=env,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError("signer-backed Codex requires a valid bundled model catalog") from exc
+    if completed.returncode != 0 or len(completed.stdout) > _BROKERED_MODEL_CATALOG_MAX_BYTES:
+        raise RuntimeError("signer-backed Codex requires a valid bundled model catalog")
+    try:
+        catalog = json.loads(completed.stdout)
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise RuntimeError("signer-backed Codex requires a valid bundled model catalog") from exc
+    if not _valid_brokered_model_catalog(catalog):
+        raise RuntimeError("signer-backed Codex requires a valid bundled model catalog")
+
+    target_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(target_dir, 0o700)
+    catalog_path = target_dir / _CODEX_MODEL_CATALOG_FILENAME
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f"{_CODEX_MODEL_CATALOG_FILENAME}.",
+        dir=str(target_dir),
+    )
+    try:
+        os.chmod(tmp_name, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(catalog, handle, separators=(",", ":"))
+        os.replace(tmp_name, catalog_path)
+        os.chmod(catalog_path, 0o600)
+    except OSError as exc:
+        with suppress(OSError):
+            catalog_path.unlink()
+        raise RuntimeError("signer-backed Codex requires a valid bundled model catalog") from exc
+    finally:
+        with suppress(FileNotFoundError):
+            os.unlink(tmp_name)
+    if not set_codex_model_catalog_path(target_dir / "config.toml", catalog_path):
+        with suppress(OSError):
+            catalog_path.unlink()
+        raise RuntimeError("signer-backed Codex requires a valid bundled model catalog")
+    return catalog_path
 
 
 # Top-level ``model_reasoning_effort = "<value>"`` assignment, tolerating
@@ -1929,7 +2024,7 @@ def _brokered_codex_config_overrides(
     base_url: str,
 ) -> list[str]:
     """Pin Codex to the signer relay placeholder without a host auth command."""
-    provider_name = "omnigent_brokered"
+    provider_name = _BROKERED_CODEX_PROVIDER_NAME
     return [
         f"model={json.dumps(model)}",
         f'model_provider="{provider_name}"',
@@ -2356,6 +2451,7 @@ class _CodexAppServerSession:
         os_env: OSEnvSpec | None = None,
         signer_factory: Callable[[], ModelSignerSession] | None = None,
         provider_auth_authority: tuple[str, str] | None = None,
+        thread_model_provider: str | None = None,
     ) -> None:
         self._codex_path = codex_path
         self._cwd = cwd
@@ -2369,6 +2465,7 @@ class _CodexAppServerSession:
         self._os_env_spec = os_env
         self._signer_factory = signer_factory
         self._provider_auth_authority = provider_auth_authority
+        self._thread_model_provider = thread_model_provider
         self._signer: ModelSignerSession | None = None
         self._signer_readiness: SignerReadiness | None = None
         self._signer_watch_task: asyncio.Task[None] | None = None
@@ -2524,6 +2621,15 @@ class _CodexAppServerSession:
             inject_hooks=router_bridge_dir is not None,
             extend_model_catalog=codex_extended_catalog_requested(self._env),
             include_credentials=self._signer is None,
+            required_brokered_probe=(
+                (
+                    self._codex_path,
+                    Path(self._cwd or os.getcwd()).resolve(strict=False),
+                    self._os_env_spec,
+                )
+                if self._signer is not None and self._os_env_spec is not None
+                else None
+            ),
         )
         self._codex_config_overrides = materialize_codex_provider_config(
             self._codex_home_dir,
@@ -3117,6 +3223,8 @@ class _CodexAppServerSession:
                 "model": model,
                 "sandbox": sandbox,
             }
+            if self._thread_model_provider is not None:
+                params["modelProvider"] = self._thread_model_provider
             if system_prompt:
                 params["developerInstructions"] = system_prompt
             if tools:
@@ -3848,6 +3956,9 @@ def _default_app_session_factory(
             if signer_launch_config is not None and signer_launch_config.auth_profile is not None
             else None
         ),
+        thread_model_provider=(
+            _BROKERED_CODEX_PROVIDER_NAME if signer_launch_config is not None else None
+        ),
     )
 
 
@@ -3986,6 +4097,11 @@ class CodexExecutor(Executor):
         if signer_launch_config is not None:
             if os_env is None or os_env.sandbox is None or os_env.sandbox.type == "none":
                 raise OSError("signer-backed Codex worker requires an active sandbox")
+            if os_env.sandbox.egress_rules:
+                raise ValueError(
+                    "signer-backed Codex does not support os_env.sandbox.egress_rules; "
+                    "brokered sessions are model-only"
+                )
             if model is None:
                 raise ValueError("signer-backed Codex requires an explicit model")
             if (

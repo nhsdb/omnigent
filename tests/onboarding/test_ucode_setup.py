@@ -33,7 +33,7 @@ def test_find_ucode_command_prefers_uvx_pinned_commit() -> None:
         assert find_ucode_command() == [
             "/usr/bin/uvx",
             "--from",
-            "git+https://github.com/databricks/ucode@94271a78c7139220b7333bcae91e522f95ef3af3",
+            "git+https://github.com/databricks/ucode@cc03434915fc9d2e64ab5d4b98007f284a653e85",
             "ucode",
         ]
 
@@ -89,7 +89,7 @@ def test_build_ucode_configure_command_supports_uvx_prefix() -> None:
         (
             "/usr/bin/uvx",
             "--from",
-            "git+https://github.com/databricks/ucode@94271a78c7139220b7333bcae91e522f95ef3af3",
+            "git+https://github.com/databricks/ucode@cc03434915fc9d2e64ab5d4b98007f284a653e85",
             "ucode",
         ),
         workspace_urls=("https://one.example.databricks.com",),
@@ -98,7 +98,7 @@ def test_build_ucode_configure_command_supports_uvx_prefix() -> None:
     assert command == [
         "/usr/bin/uvx",
         "--from",
-        "git+https://github.com/databricks/ucode@94271a78c7139220b7333bcae91e522f95ef3af3",
+        "git+https://github.com/databricks/ucode@cc03434915fc9d2e64ab5d4b98007f284a653e85",
         "ucode",
         "configure",
         "--workspaces",
